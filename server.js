@@ -1,78 +1,108 @@
+const express = require('express');
 const http = require('http');
-const fs = require('fs');
-const path = require('path');
 const WebSocket = require('ws');
+const cors = require('cors');
 
-const PORT = process.env.PORT || 3000;
-const players = new Map();
-let nextId = 1;
+const app = express();
+app.use(cors());
+app.use(express.json());
 
-const httpServer = http.createServer((req, res) => {
-  if (req.url === '/health') {
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    return res.end(JSON.stringify({ status: 'ok', players: players.size }));
-  }
-  let file = req.url === '/' ? '/index.html' : req.url.split('?')[0];
-  const full = path.join(__dirname, 'public', file);
-  fs.readFile(full, (err, data) => {
-    if (err) { res.writeHead(404); res.end('Not found'); return; }
-    const ext = path.extname(full);
-    const types = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css' };
-    res.writeHead(200, { 'Content-Type': types[ext] || 'text/plain' });
-    res.end(data);
-  });
+// Health check
+app.get('/health', (req, res) => {
+    res.json({ status: 'ok', rooms: Object.keys(rooms).length });
 });
 
-const wss = new WebSocket.Server({ server: httpServer, path: '/ws' });
+// Room list
+app.get('/rooms', (req, res) => {
+    res.json(Object.keys(rooms).map(id => ({
+        id,
+        players: rooms[id].players.size,
+        max: 8
+    })));
+});
+
+const server = http.createServer(app);
+const wss = new WebSocket.Server({ server });
+
+const rooms = {}; // { roomId: { players: Map<ws, playerData> } }
 
 wss.on('connection', (ws) => {
-  const id = nextId++;
-  players.set(id, {
-    id, name: 'Oyuncu', x: 5000, y: 5000, angle: 0,
-    health: 100, age: 0, ageScore: 0, color: 0,
-    weapon: 'hammer', kills: 0, deaths: 0
-  });
-  console.log('[+] #' + id + ' (toplam: ' + players.size + ')');
-  ws.send(JSON.stringify({ type: 'init', you: id, players: [...players.values()] }));
-  broadcast({ type: 'join', player: players.get(id) }, id);
+    let roomId = null;
+    let playerId = null;
 
-  ws.on('message', (raw) => {
-    let msg; try { msg = JSON.parse(raw); } catch { return; }
-    const p = players.get(id);
-    if (!p) return;
-    if (msg.type === 'move') { p.x = msg.x; p.y = msg.y; p.angle = msg.angle; }
-    else if (msg.type === 'stats') {
-      p.age = msg.age; p.ageScore = msg.ageScore;
-      p.weapon = msg.weapon; p.health = msg.health;
-      p.kills = msg.kills; p.deaths = msg.deaths;
-    }
-    else if (msg.type === 'profile') {
-      p.name = String(msg.name || 'Oyuncu').slice(0, 16);
-      p.color = msg.color || 0;
-    }
-  });
+    ws.on('message', (msg) => {
+        try {
+            const data = JSON.parse(msg);
 
-  ws.on('close', () => {
-    players.delete(id);
-    broadcast({ type: 'leave', id });
-    console.log('[-] #' + id + ' (kalan: ' + players.size + ')');
-  });
+            switch (data.type) {
+                case 'join':
+                    roomId = data.room;
+                    playerId = data.id;
+                    if (!rooms[roomId]) rooms[roomId] = { players: new Map() };
+                    if (rooms[roomId].players.size >= 8) {
+                        ws.send(JSON.stringify({ type: 'error', msg: 'Room full' }));
+                        return;
+                    }
+                    rooms[roomId].players.set(ws, {
+                        id: playerId,
+                        name: data.name,
+                        x: 0, y: 0, hat: 0, health: 100
+                    });
+                    ws.send(JSON.stringify({ type: 'joined', room: roomId }));
+                    broadcast(roomId, { type: 'player_join', id: playerId, name: data.name }, ws);
+                    break;
+
+                case 'sync':
+                    if (!roomId) return;
+                    const p = rooms[roomId]?.players.get(ws);
+                    if (p) {
+                        p.x = data.x;
+                        p.y = data.y;
+                        p.hat = data.hat;
+                        p.health = data.health;
+                    }
+                    broadcast(roomId, {
+                        type: 'sync',
+                        id: playerId,
+                        x: data.x,
+                        y: data.y,
+                        hat: data.hat,
+                        health: data.health
+                    }, ws);
+                    break;
+
+                case 'chat':
+                    broadcast(roomId, {
+                        type: 'chat',
+                        id: playerId,
+                        name: data.name,
+                        msg: data.msg
+                    });
+                    break;
+            }
+        } catch (e) {
+            console.error('Parse error:', e);
+        }
+    });
+
+    ws.on('close', () => {
+        if (roomId && rooms[roomId]) {
+            rooms[roomId].players.delete(ws);
+            broadcast(roomId, { type: 'player_leave', id: playerId });
+            if (rooms[roomId].players.size === 0) delete rooms[roomId];
+        }
+    });
 });
 
-function broadcast(obj, exceptId) {
-  const data = JSON.stringify(obj);
-  for (const [id, ws] of wss.clients) {
-    if (ws.readyState === WebSocket.OPEN && id !== exceptId) ws.send(data);
-  }
+function broadcast(roomId, msg, except) {
+    if (!rooms[roomId]) return;
+    const str = JSON.stringify(msg);
+    rooms[roomId].players.forEach((_, ws) => {
+        if (ws !== except && ws.readyState === 1) ws.send(str);
+    });
 }
 
-setInterval(() => {
-  const snapshot = [...players.values()];
-  const leaderboard = snapshot.slice()
-    .sort((a, b) => b.ageScore - a.ageScore).slice(0, 10)
-    .map(p => ({ id: p.id, name: p.name, score: Math.floor(p.ageScore), age: Math.floor(p.age), color: p.color }));
-  const packet = JSON.stringify({ type: 'state', players: snapshot, leaderboard });
-  for (const ws of wss.clients) if (ws.readyState === WebSocket.OPEN) ws.send(packet);
-}, 50);
-
-httpServer.listen(PORT, () => console.log('SUNUCU ' + PORT + ' PORTUNDA HAZIR'));
+const PORT = process.env.PORT || 8080;
+server.listen(PORT, () => {
+    console.log(`SUNUCU ${PORT} PORTUNDA HAZIR`);
+});
